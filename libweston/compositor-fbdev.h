@@ -52,6 +52,7 @@ struct weston_fbdev_backend_config {
 	 */
 	void (*configure_device)(struct weston_compositor *compositor,
 				 struct libinput_device *device);
+	char *seat_id;
 };
 
 #ifdef  __cplusplus
