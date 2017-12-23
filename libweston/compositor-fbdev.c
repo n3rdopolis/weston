@@ -711,6 +711,71 @@ fbdev_restore(struct weston_compositor *compositor)
 	weston_launcher_restore(compositor->launcher);
 }
 
+static char *
+find_framebuffer_device(struct fbdev_backend *b, const char *seat)
+{
+	struct udev_enumerate *e;
+	struct udev_list_entry *entry;
+	const char *path, *device_seat;
+	char *fb_device, *find_device, *id;
+	struct udev_device *device, *pci;
+
+	e = udev_enumerate_new(b->udev);
+	udev_enumerate_add_match_subsystem(e, "graphics");
+	udev_enumerate_add_match_sysname(e, "fb[0-9]*");
+
+	udev_enumerate_scan_devices(e);
+	fb_device = NULL;
+	udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(e)) {
+		bool is_boot_vga = false;
+
+		path = udev_list_entry_get_name(entry);
+		device = udev_device_new_from_syspath(b->udev, path);
+		find_device = udev_device_get_devnode(device);
+		if (!device)
+			continue;
+		device_seat = udev_device_get_property_value(device, "ID_SEAT");
+		if (!device_seat)
+			device_seat = default_seat;
+		if (strcmp(device_seat, seat)) {
+			udev_device_unref(device);
+			continue;
+		}
+
+		pci = udev_device_get_parent_with_subsystem_devtype(device,
+								"pci", NULL);
+		if (pci) {
+			id = udev_device_get_sysattr_value(pci, "boot_vga");
+			if (id && !strcmp(id, "1"))
+				is_boot_vga = true;
+		}
+
+		/* If a framebuffer device was found, and this device isn't
+		 * the boot-VGA device, don't use it. */
+		if (!is_boot_vga && fb_device) {
+			udev_device_unref(device);
+			continue;
+		}
+
+		/* There can only be one boot_vga device. Try to use it
+		 * at all costs. */
+		if (is_boot_vga) {
+			fb_device = strdup(find_device);
+			udev_device_unref(device);
+			break;
+		}
+
+		/* Per the (!is_boot_vga && fb_device) test above, only
+		 * trump existing saved devices with boot-VGA devices, so if
+		 * the test ends up here, this must be the first device seen. */
+		assert(!fb_device);
+		fb_device = find_device;
+	}
+
+	udev_enumerate_unref(e);
+	return fb_device;
+}
+
 static struct fbdev_backend *
 fbdev_backend_create(struct weston_compositor *compositor,
                      struct weston_fbdev_backend_config *param)
@@ -743,6 +808,11 @@ fbdev_backend_create(struct weston_compositor *compositor,
 		goto out_compositor;
 	}
 
+	if (!param->device)
+		param->device = strdup(find_framebuffer_device(backend, seat_id));
+	if (!param->device)
+		param->device = strdup("/dev/fb0");
+
 	/* Set up the TTY. */
 	backend->session_listener.notify = session_notify;
 	wl_signal_add(&compositor->session_signal,
@@ -769,12 +839,15 @@ fbdev_backend_create(struct weston_compositor *compositor,
 	if (fbdev_output_create(backend, param->device) < 0)
 		goto out_launcher;
 
+	free(param->device);
+
 	udev_input_init(&backend->input, compositor, backend->udev,
 			seat_id, param->configure_device);
 
 	return backend;
 
 out_launcher:
+	free(param->device);
 	weston_launcher_destroy(compositor->launcher);
 
 out_udev:
@@ -790,10 +863,8 @@ out_compositor:
 static void
 config_init_to_defaults(struct weston_fbdev_backend_config *config)
 {
-	/* TODO: Ideally, available frame buffers should be enumerated using
-	 * udev, rather than passing a device node in as a parameter. */
 	config->tty = 0; /* default to current tty */
-	config->device = "/dev/fb0"; /* default frame buffer */
+	config->device = NULL;
 	config->seat_id = NULL;
 }
 
