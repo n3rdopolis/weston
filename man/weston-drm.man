@@ -101,8 +101,8 @@ status. For example, use
 \fB\-\-seat\fR=\fIseatid\fR
 Use graphics and input devices designated for seat
 .I seatid
-instead of the default seat
-.BR seat0 .
+instead of the seat defined in the environment variable
+. BR XDG_SEAT " , and If neither is specifed, seat0 will be assumed."
 .TP
 \fB\-\-tty\fR=\fIx\fR
 Launch Weston on tty
@@ -124,6 +124,9 @@ The file descriptor (integer) where
 .B weston-launch
 is listening. Automatically set by
 .BR weston-launch .
+.TP
+.B XDG_SEAT
+The seat that Weston will start on.
 .
 .\" ***************************************************************
 .SH "SEE ALSO"

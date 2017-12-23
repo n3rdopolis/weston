@@ -4036,7 +4036,12 @@ drm_backend_create(struct weston_compositor *compositor,
 	struct udev_device *drm_device;
 	struct wl_event_loop *loop;
 	const char *seat_id = default_seat;
+	const char *session_seat;
 	int ret;
+
+	session_seat = getenv("XDG_SEAT");
+	if (session_seat)
+		seat_id = session_seat;
 
 	weston_log("initializing drm backend\n");
 
