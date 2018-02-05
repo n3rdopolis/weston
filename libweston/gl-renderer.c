@@ -60,6 +60,12 @@
 #include "shared/timespec-util.h"
 #include "weston-egl-ext.h"
 
+#define GR_GL_VERSION(major, minor) \
+	(((uint32_t)(major) << 16) | (uint32_t)(minor))
+
+#define GR_GL_VERSION_INVALID \
+	GR_GL_VERSION(0, 0)
+
 struct gl_shader {
 	GLuint program;
 	GLuint vertex_shader, fragment_shader;
@@ -198,6 +204,8 @@ struct gl_renderer {
 	EGLConfig egl_config;
 
 	EGLSurface dummy_surface;
+
+	uint32_t gl_version;
 
 	struct wl_array vertices;
 	struct wl_array vtxcnt;
@@ -2088,14 +2096,23 @@ gl_renderer_query_dmabuf_formats(struct weston_compositor *wc,
 				int **formats, int *num_formats)
 {
 	struct gl_renderer *gr = get_renderer(wc);
+	static const int fallback_formats[] = {
+		DRM_FORMAT_ARGB8888,
+		DRM_FORMAT_XRGB8888,
+		DRM_FORMAT_YUYV,
+		DRM_FORMAT_NV12,
+		DRM_FORMAT_YUV420,
+		DRM_FORMAT_YUV444,
+	};
+	bool fallback = false;
 	EGLint num;
 
 	assert(gr->has_dmabuf_import);
 
 	if (!gr->has_dmabuf_import_modifiers ||
 	    !gr->query_dmabuf_formats(gr->egl_display, 0, NULL, &num)) {
-		*num_formats = 0;
-		return;
+		num = gr->has_gl_texture_rg ? ARRAY_LENGTH(fallback_formats) : 2;
+		fallback = true;
 	}
 
 	*formats = calloc(num, sizeof(int));
@@ -2103,6 +2120,13 @@ gl_renderer_query_dmabuf_formats(struct weston_compositor *wc,
 		*num_formats = 0;
 		return;
 	}
+
+	if (fallback) {
+		memcpy(formats, fallback_formats, num * sizeof(int));
+		*num_formats = num;
+		return;
+	}
+
 	if (!gr->query_dmabuf_formats(gr->egl_display, num, *formats, &num)) {
 		*num_formats = 0;
 		free(*formats);
@@ -2156,7 +2180,7 @@ gl_renderer_import_dmabuf(struct weston_compositor *ec,
 
 	for (i = 0; i < dmabuf->attributes.n_planes; i++) {
 		/* return if EGL doesn't support import modifiers */
-		if (dmabuf->attributes.modifier[i] != 0)
+		if (dmabuf->attributes.modifier[i] != DRM_FORMAT_MOD_INVALID)
 			if (!gr->has_dmabuf_import_modifiers)
 				return false;
 
@@ -3213,9 +3237,6 @@ gl_renderer_setup_egl_extensions(struct weston_compositor *ec)
 		gr->has_dmabuf_import_modifiers = 1;
 	}
 
-	if (weston_check_egl_extension(extensions, "GL_EXT_texture_rg"))
-		gr->has_gl_texture_rg = 1;
-
 	if (weston_check_egl_extension(extensions, "EGL_KHR_fence_sync") &&
 	    weston_check_egl_extension(extensions, "EGL_ANDROID_native_fence_sync")) {
 		gr->create_sync =
@@ -3586,6 +3607,22 @@ fan_debug_repaint_binding(struct weston_keyboard *keyboard,
 	weston_compositor_damage_all(compositor);
 }
 
+static uint32_t
+get_gl_version(void)
+{
+	const char *version;
+	int major, minor;
+
+	version = (const char *) glGetString(GL_VERSION);
+	if (version &&
+	    (sscanf(version, "%d.%d", &major, &minor) == 2 ||
+	     sscanf(version, "OpenGL ES %d.%d", &major, &minor) == 2)) {
+		return GR_GL_VERSION(major, minor);
+	}
+
+	return GR_GL_VERSION_INVALID;
+}
+
 static int
 gl_renderer_setup(struct weston_compositor *ec, EGLSurface egl_surface)
 {
@@ -3594,8 +3631,8 @@ gl_renderer_setup(struct weston_compositor *ec, EGLSurface egl_surface)
 	EGLConfig context_config;
 	EGLBoolean ret;
 
-	static const EGLint context_attribs[] = {
-		EGL_CONTEXT_CLIENT_VERSION, 2,
+	EGLint context_attribs[] = {
+		EGL_CONTEXT_CLIENT_VERSION, 0,
 		EGL_NONE
 	};
 
@@ -3610,12 +3647,22 @@ gl_renderer_setup(struct weston_compositor *ec, EGLSurface egl_surface)
 	if (gr->has_configless_context)
 		context_config = EGL_NO_CONFIG_KHR;
 
+	/* try to create an OpenGLES 3 context first */
+	context_attribs[1] = 3;
 	gr->egl_context = eglCreateContext(gr->egl_display, context_config,
 					   EGL_NO_CONTEXT, context_attribs);
 	if (gr->egl_context == NULL) {
-		weston_log("failed to create context\n");
-		gl_renderer_print_egl_error_state();
-		return -1;
+		/* and then fallback to OpenGLES 2 */
+		context_attribs[1] = 2;
+		gr->egl_context = eglCreateContext(gr->egl_display,
+						   context_config,
+						   EGL_NO_CONTEXT,
+						   context_attribs);
+		if (gr->egl_context == NULL) {
+			weston_log("failed to create context\n");
+			gl_renderer_print_egl_error_state();
+			return -1;
+		}
 	}
 
 	ret = eglMakeCurrent(gr->egl_display, egl_surface,
@@ -3624,6 +3671,13 @@ gl_renderer_setup(struct weston_compositor *ec, EGLSurface egl_surface)
 		weston_log("Failed to make EGL context current.\n");
 		gl_renderer_print_egl_error_state();
 		return -1;
+	}
+
+	gr->gl_version = get_gl_version();
+	if (gr->gl_version == GR_GL_VERSION_INVALID) {
+		weston_log("warning: failed to detect GLES version, "
+			   "defaulting to 2.0.\n");
+		gr->gl_version = GR_GL_VERSION(2, 0);
 	}
 
 	log_egl_gl_info(gr->egl_display);
@@ -3647,8 +3701,13 @@ gl_renderer_setup(struct weston_compositor *ec, EGLSurface egl_surface)
 	else
 		ec->read_format = PIXMAN_a8b8g8r8;
 
-	if (weston_check_egl_extension(extensions, "GL_EXT_unpack_subimage"))
+	if (gr->gl_version >= GR_GL_VERSION(3, 0) ||
+	    weston_check_egl_extension(extensions, "GL_EXT_unpack_subimage"))
 		gr->has_unpack_subimage = 1;
+
+	if (gr->gl_version >= GR_GL_VERSION(3, 0) ||
+	    weston_check_egl_extension(extensions, "GL_EXT_texture_rg"))
+		gr->has_gl_texture_rg = 1;
 
 	if (weston_check_egl_extension(extensions, "GL_OES_EGL_image_external"))
 		gr->has_egl_image_external = 1;
